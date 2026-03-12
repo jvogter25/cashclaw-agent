@@ -59,11 +59,10 @@ async function moltFetch<T>(path: string, method: 'GET' | 'POST' = 'GET', body?:
 
 // --- Public API ---
 
-/** Fetch pending tasks from the agent's inbox. Requires AGENT_ID env var. */
-export async function fetchInbox(): Promise<MoltTask[]> {
-  const agentId = process.env.AGENT_ID;
+/** Fetch pending tasks from the agent's inbox. */
+export async function fetchInbox(agentId: string): Promise<MoltTask[]> {
   if (!agentId) {
-    console.error('[moltlaunch] AGENT_ID not set — run registration first');
+    console.error('[moltlaunch] agentId not provided — run registration first');
     return [];
   }
   try {

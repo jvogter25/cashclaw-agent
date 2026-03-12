@@ -7,8 +7,6 @@ import {
   claimPayment,
   type MoltTask,
 } from './moltlaunch.js';
-import { analyzeTask } from './analyze.js';
-import { executeSkill } from './executor.js';
 import {
   postToDiscord,
   taskAcceptedMsg,
@@ -19,10 +17,15 @@ import {
   errorMsg,
 } from './discord.js';
 
-// Track tasks we've already processed to avoid double-handling
-const processedTaskIds = new Set<string>();
+export interface TaskAnalysis {
+  accepted: boolean;
+  skill: string | null;
+  priceEth: number;
+  quoteMessage: string;
+  declineReason?: string;
+  target: string;
+}
 
-// Track tasks waiting for escrow confirmation: taskId -> { analysis, quotedAt }
 interface PendingEscrow {
   taskId: string;
   skill: string;
@@ -30,122 +33,116 @@ interface PendingEscrow {
   priceEth: number;
   quotedAt: number;
 }
-const pendingEscrow = new Map<string, PendingEscrow>();
 
-// Track tasks in execution: taskId -> { submittedAt, priceEth }
 interface SubmittedTask {
   submittedAt: number;
   priceEth: number;
 }
-const submittedTasks = new Map<string, SubmittedTask>();
 
-/** Called every 2 minutes — poll inbox for new tasks */
-export async function pollInbox(): Promise<void> {
-  console.log('[inbox] Polling Moltlaunch inbox...');
+/** Create an isolated poll loop for one agent. Call the returned function on an interval. */
+export function createAgentPoller(
+  agentId: string,
+  agentName: string,
+  analyzeTask: (text: string) => Promise<TaskAnalysis>,
+  executeSkill: (skill: string, target: string) => Promise<string>,
+) {
+  const processedTaskIds = new Set<string>();
+  const pendingEscrow = new Map<string, PendingEscrow>();
+  const submittedTasks = new Map<string, SubmittedTask>();
 
-  // 1. Check for new tasks
-  const tasks = await fetchInbox();
-  for (const task of tasks) {
-    if (processedTaskIds.has(task.id)) continue;
-    processedTaskIds.add(task.id);
-    await handleNewTask(task).catch(err =>
-      postToDiscord(errorMsg('handleNewTask', (err as Error).message))
-    );
+  async function handleNewTask(task: MoltTask): Promise<void> {
+    console.log(`[${agentName}] New task ${task.id}: "${task.task.slice(0, 80)}"`);
+    const analysis = await analyzeTask(task.task);
+
+    if (!analysis.accepted || !analysis.skill) {
+      await declineTask(task.id, analysis.declineReason ?? 'Skill not available.');
+      await postToDiscord(taskDeclinedMsg(agentName, task.id, analysis.declineReason ?? 'Skill not available.'));
+      return;
+    }
+
+    const quoted = await submitQuote(task.id, analysis.priceEth, analysis.quoteMessage);
+    if (!quoted) {
+      console.error(`[${agentName}] Failed to quote task ${task.id}`);
+      return;
+    }
+
+    await postToDiscord(taskAcceptedMsg(agentName, task.id, analysis.skill, analysis.priceEth, analysis.target));
+    pendingEscrow.set(task.id, {
+      taskId: task.id,
+      skill: analysis.skill,
+      target: analysis.target,
+      priceEth: analysis.priceEth,
+      quotedAt: Date.now(),
+    });
   }
 
-  // 2. Check escrow status for pending tasks
-  for (const [taskId, pending] of pendingEscrow.entries()) {
-    await checkEscrowAndExecute(taskId, pending).catch(err =>
-      postToDiscord(errorMsg('checkEscrow', (err as Error).message))
-    );
-  }
+  async function checkEscrowAndExecute(taskId: string, pending: PendingEscrow): Promise<void> {
+    const status = await getTaskStatus(taskId);
 
-  // 3. Claim payments for tasks past the 24hr window
-  const now = Date.now();
-  const CLAIM_WINDOW_MS = 24 * 60 * 60 * 1000;
-  for (const [taskId, sub] of submittedTasks.entries()) {
-    if (now - sub.submittedAt >= CLAIM_WINDOW_MS) {
-      await attemptClaimPayment(taskId, sub.priceEth);
-      submittedTasks.delete(taskId);
+    if (status !== 'accepted') {
+      const ageMs = Date.now() - pending.quotedAt;
+      if (ageMs > 48 * 60 * 60 * 1000) {
+        console.log(`[${agentName}] Task ${taskId} quote expired`);
+        pendingEscrow.delete(taskId);
+      }
+      return;
+    }
+
+    pendingEscrow.delete(taskId);
+    await postToDiscord(escrowConfirmedMsg(agentName, taskId));
+    console.log(`[${agentName}] Task ${taskId} accepted — executing skill=${pending.skill}`);
+
+    try {
+      const deliverable = await executeSkill(pending.skill, pending.target);
+      const submitted = await submitDeliverable(taskId, deliverable);
+      if (submitted) {
+        await postToDiscord(deliverableSubmittedMsg(agentName, taskId));
+        submittedTasks.set(taskId, { submittedAt: Date.now(), priceEth: pending.priceEth });
+      } else {
+        await postToDiscord(errorMsg(agentName, `submit task ${taskId}`, 'submitDeliverable returned false'));
+      }
+    } catch (err) {
+      await postToDiscord(errorMsg(agentName, `execute task ${taskId}`, (err as Error).message));
     }
   }
 
-  console.log(`[inbox] Done. Pending escrow: ${pendingEscrow.size}, Awaiting claim: ${submittedTasks.size}`);
-}
-
-async function handleNewTask(task: MoltTask): Promise<void> {
-  console.log(`[inbox] New task ${task.id}: "${task.task.slice(0, 80)}"`);
-
-  const analysis = await analyzeTask(task.task);
-
-  if (!analysis.accepted || !analysis.skill) {
-    // Decline
-    await declineTask(task.id, analysis.declineReason ?? 'Skill not available.');
-    await postToDiscord(taskDeclinedMsg(task.id, analysis.declineReason ?? 'Skill not available.'));
-    console.log(`[inbox] Task ${task.id} declined.`);
-    return;
-  }
-
-  // Submit quote
-  const quoted = await submitQuote(task.id, analysis.priceEth, analysis.quoteMessage);
-  if (!quoted) {
-    console.error(`[inbox] Failed to quote task ${task.id}`);
-    return;
-  }
-
-  await postToDiscord(taskAcceptedMsg(task.id, analysis.skill, analysis.priceEth, analysis.target));
-
-  // Track for escrow confirmation
-  pendingEscrow.set(task.id, {
-    taskId: task.id,
-    skill: analysis.skill,
-    target: analysis.target,
-    priceEth: analysis.priceEth,
-    quotedAt: Date.now(),
-  });
-}
-
-async function checkEscrowAndExecute(taskId: string, pending: PendingEscrow): Promise<void> {
-  const status = await getTaskStatus(taskId);
-
-  if (status !== 'accepted') {
-    // Quotes expire after 48 hours with no response
-    const AGE_MS = Date.now() - pending.quotedAt;
-    if (AGE_MS > 48 * 60 * 60 * 1000) {
-      console.log(`[inbox] Task ${taskId} quote expired — removing from pending`);
-      pendingEscrow.delete(taskId);
-    }
-    return;
-  }
-
-  // Escrow confirmed!
-  pendingEscrow.delete(taskId);
-  await postToDiscord(escrowConfirmedMsg(taskId));
-  console.log(`[inbox] Task ${taskId} accepted — executing skill=${pending.skill}`);
-
-  try {
-    const deliverable = await executeSkill(pending.skill as any, pending.target);
-    const submitted = await submitDeliverable(taskId, deliverable);
-
-    if (submitted) {
-      await postToDiscord(deliverableSubmittedMsg(taskId));
-      submittedTasks.set(taskId, { submittedAt: Date.now(), priceEth: pending.priceEth });
-      console.log(`[inbox] Task ${taskId} deliverable submitted.`);
+  async function attemptClaimPayment(taskId: string, priceEth: number): Promise<void> {
+    console.log(`[${agentName}] Claiming payment for task ${taskId}`);
+    const claimed = await claimPayment(taskId);
+    if (claimed) {
+      await postToDiscord(paymentClaimedMsg(agentName, taskId, priceEth));
     } else {
-      await postToDiscord(errorMsg(`submit task ${taskId}`, 'submitDeliverable returned false'));
+      await postToDiscord(errorMsg(agentName, `claim payment ${taskId}`, 'claimPayment returned false'));
     }
-  } catch (err) {
-    await postToDiscord(errorMsg(`execute task ${taskId}`, (err as Error).message));
   }
-}
 
-async function attemptClaimPayment(taskId: string, priceEth: number): Promise<void> {
-  console.log(`[inbox] Claiming payment for task ${taskId}`);
-  const claimed = await claimPayment(taskId);
-  if (claimed) {
-    await postToDiscord(paymentClaimedMsg(taskId, priceEth));
-    console.log(`[inbox] Payment claimed for task ${taskId}: ${priceEth} ETH`);
-  } else {
-    await postToDiscord(errorMsg(`claim payment ${taskId}`, 'claimPayment returned false'));
-  }
+  return async function pollInbox(): Promise<void> {
+    console.log(`[${agentName}] Polling Moltlaunch inbox...`);
+
+    const tasks = await fetchInbox(agentId);
+    for (const task of tasks) {
+      if (processedTaskIds.has(task.id)) continue;
+      processedTaskIds.add(task.id);
+      await handleNewTask(task).catch(err =>
+        postToDiscord(errorMsg(agentName, 'handleNewTask', (err as Error).message))
+      );
+    }
+
+    for (const [taskId, pending] of pendingEscrow.entries()) {
+      await checkEscrowAndExecute(taskId, pending).catch(err =>
+        postToDiscord(errorMsg(agentName, 'checkEscrow', (err as Error).message))
+      );
+    }
+
+    const now = Date.now();
+    const CLAIM_WINDOW_MS = 24 * 60 * 60 * 1000;
+    for (const [taskId, sub] of submittedTasks.entries()) {
+      if (now - sub.submittedAt >= CLAIM_WINDOW_MS) {
+        await attemptClaimPayment(taskId, sub.priceEth);
+        submittedTasks.delete(taskId);
+      }
+    }
+
+    console.log(`[${agentName}] Done. Pending escrow: ${pendingEscrow.size}, Awaiting claim: ${submittedTasks.size}`);
+  };
 }

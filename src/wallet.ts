@@ -38,7 +38,7 @@ export function loadOrCreateWallet(): WalletInfo {
   // First startup: generate new wallet and log credentials
   const wallet = generateWallet();
   console.log('\n========================================');
-  console.log('CASHCLAW WALLET GENERATED — SAVE THESE!');
+  console.log('AGENT WALLET GENERATED — SAVE THESE!');
   console.log('========================================');
   console.log(`AGENT_ADDRESS=${wallet.address}`);
   console.log(`MOLTLAUNCH_PRIVATE_KEY=${wallet.privateKey}`);
