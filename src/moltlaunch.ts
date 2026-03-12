@@ -17,9 +17,8 @@ export interface MoltTask {
   id: string;
   agentId: string;
   clientAddress: string;
-  requestText: string;
-  priceWei: string;
-  createdAt: string;
+  task: string;
+  createdAt: number;
   status: 'requested' | 'quoted' | 'accepted' | 'submitted' | 'completed' | 'declined' | 'cancelled';
 }
 

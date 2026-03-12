@@ -74,9 +74,9 @@ export async function pollInbox(): Promise<void> {
 }
 
 async function handleNewTask(task: MoltTask): Promise<void> {
-  console.log(`[inbox] New task ${task.id}: "${task.requestText.slice(0, 80)}"`);
+  console.log(`[inbox] New task ${task.id}: "${task.task.slice(0, 80)}"`);
 
-  const analysis = await analyzeTask(task.requestText);
+  const analysis = await analyzeTask(task.task);
 
   if (!analysis.accepted || !analysis.skill) {
     // Decline
