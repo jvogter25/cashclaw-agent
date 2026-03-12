@@ -7,6 +7,8 @@
  * The private key signs a timestamp to produce a short-lived JWT-like auth header.
  */
 
+import { createHmac } from 'node:crypto';
+
 export interface MoltTask {
   id: string;
   clientAddress: string;
@@ -27,7 +29,6 @@ function authHeader(): Record<string, string> {
   const agentAddress = process.env.AGENT_ADDRESS ?? '';
   const timestamp = Date.now().toString();
   // Simple HMAC-based auth — replace with actual signing scheme from Moltlaunch docs
-  const { createHmac } = require('crypto');
   const sig = createHmac('sha256', privateKey).update(timestamp).digest('hex');
   return {
     'Content-Type': 'application/json',
