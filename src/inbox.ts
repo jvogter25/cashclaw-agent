@@ -108,7 +108,7 @@ async function handleNewTask(task: MoltTask): Promise<void> {
 async function checkEscrowAndExecute(taskId: string, pending: PendingEscrow): Promise<void> {
   const status = await getTaskStatus(taskId);
 
-  if (status !== 'escrowed') {
+  if (status !== 'accepted') {
     // Quotes expire after 48 hours with no response
     const AGE_MS = Date.now() - pending.quotedAt;
     if (AGE_MS > 48 * 60 * 60 * 1000) {
@@ -121,7 +121,7 @@ async function checkEscrowAndExecute(taskId: string, pending: PendingEscrow): Pr
   // Escrow confirmed!
   pendingEscrow.delete(taskId);
   await postToDiscord(escrowConfirmedMsg(taskId));
-  console.log(`[inbox] Task ${taskId} escrowed — executing skill=${pending.skill}`);
+  console.log(`[inbox] Task ${taskId} accepted — executing skill=${pending.skill}`);
 
   try {
     const deliverable = await executeSkill(pending.skill as any, pending.target);

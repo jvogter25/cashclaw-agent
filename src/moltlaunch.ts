@@ -1,67 +1,74 @@
 /**
  * Moltlaunch API client.
- * Moltlaunch is an on-chain escrow marketplace for AI agent tasks.
+ * Moltlaunch is an onchain escrow marketplace for AI agent tasks on Base.
  * API base: https://api.moltlaunch.com
  *
- * All requests are authenticated with the agent's private key via Bearer token.
- * The private key signs a timestamp to produce a short-lived JWT-like auth header.
+ * Auth: EIP-191 personal sign of `moltlaunch:{action}:{taskId}:{timestamp}:{nonce}`
+ * AgentId: uint256 from onchain ERC-8004 registration (stored in AGENT_ID env var)
+ * Prices: in Wei (1 ETH = 1e18 Wei)
  */
 
-import { createHmac } from 'node:crypto';
-
-export interface MoltTask {
-  id: string;
-  clientAddress: string;
-  requestText: string;
-  budgetEth: number;
-  createdAt: string;
-  status: 'pending' | 'quoted' | 'escrowed' | 'submitted' | 'completed' | 'declined';
-}
-
-export interface MoltInboxResponse {
-  tasks: MoltTask[];
-}
+import { randomUUID } from 'node:crypto';
+import { privateKeyToAccount } from 'viem/accounts';
 
 const BASE_URL = process.env.MOLTLAUNCH_API_URL ?? 'https://api.moltlaunch.com';
 
-function authHeader(): Record<string, string> {
-  const privateKey = process.env.MOLTLAUNCH_PRIVATE_KEY ?? '';
-  const agentAddress = process.env.AGENT_ADDRESS ?? '';
-  const timestamp = Date.now().toString();
-  // Simple HMAC-based auth — replace with actual signing scheme from Moltlaunch docs
-  const sig = createHmac('sha256', privateKey).update(timestamp).digest('hex');
-  return {
-    'Content-Type': 'application/json',
-    'X-Agent-Address': agentAddress,
-    'X-Timestamp': timestamp,
-    'X-Signature': sig,
-  };
+export interface MoltTask {
+  id: string;
+  agentId: string;
+  clientAddress: string;
+  requestText: string;
+  priceWei: string;
+  createdAt: string;
+  status: 'requested' | 'quoted' | 'accepted' | 'submitted' | 'completed' | 'declined' | 'cancelled';
 }
 
-async function moltFetch<T>(
-  path: string,
-  method: 'GET' | 'POST' = 'GET',
-  body?: unknown
-): Promise<T> {
+// --- Auth ---
+
+function buildAuthMessage(action: string, taskId: string, timestamp: number, nonce: string): string {
+  return `moltlaunch:${action}:${taskId}:${timestamp}:${nonce}`;
+}
+
+async function signAction(action: string, taskId: string): Promise<{ signature: string; timestamp: number; nonce: string }> {
+  const privateKey = process.env.MOLTLAUNCH_PRIVATE_KEY as `0x${string}`;
+  if (!privateKey) throw new Error('MOLTLAUNCH_PRIVATE_KEY not set');
+  const account = privateKeyToAccount(privateKey);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const nonce = randomUUID();
+  const message = buildAuthMessage(action, taskId, timestamp, nonce);
+  const signature = await account.signMessage({ message });
+  return { signature, timestamp, nonce };
+}
+
+// --- HTTP helper ---
+
+async function moltFetch<T>(path: string, method: 'GET' | 'POST' = 'GET', body?: unknown): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
-    headers: authHeader(),
+    headers: { 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(15000),
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Moltlaunch ${method} ${path} failed: ${res.status} ${res.statusText} — ${text}`);
+    const err = await res.json().catch(() => ({ error: res.statusText })) as { error?: string };
+    throw new Error(`Moltlaunch ${method} ${path} failed: ${res.status} — ${err.error ?? res.statusText}`);
   }
 
   return res.json() as Promise<T>;
 }
 
-/** Fetch tasks from the agent's inbox. Returns pending (un-quoted) tasks. */
+// --- Public API ---
+
+/** Fetch pending tasks from the agent's inbox. Requires AGENT_ID env var. */
 export async function fetchInbox(): Promise<MoltTask[]> {
+  const agentId = process.env.AGENT_ID;
+  if (!agentId) {
+    console.error('[moltlaunch] AGENT_ID not set — run registration first');
+    return [];
+  }
   try {
-    const data = await moltFetch<MoltInboxResponse>('/v1/inbox');
+    const data = await moltFetch<{ tasks: MoltTask[] }>(`/api/tasks/inbox?agent=${encodeURIComponent(agentId)}`);
     return data.tasks ?? [];
   } catch (err) {
     console.error('[moltlaunch] fetchInbox error:', (err as Error).message);
@@ -69,10 +76,12 @@ export async function fetchInbox(): Promise<MoltTask[]> {
   }
 }
 
-/** Submit a price quote for a task. Returns true on success. */
+/** Submit a price quote for a task. priceEth is a float (e.g. 0.005). */
 export async function submitQuote(taskId: string, priceEth: number, message: string): Promise<boolean> {
   try {
-    await moltFetch(`/v1/task/${taskId}/quote`, 'POST', { priceEth, message });
+    const priceWei = BigInt(Math.round(priceEth * 1e18)).toString();
+    const auth = await signAction('quote', taskId);
+    await moltFetch(`/api/tasks/${taskId}/quote`, 'POST', { priceWei, message, ...auth });
     return true;
   } catch (err) {
     console.error(`[moltlaunch] submitQuote(${taskId}) error:`, (err as Error).message);
@@ -80,33 +89,32 @@ export async function submitQuote(taskId: string, priceEth: number, message: str
   }
 }
 
-/** Decline a task (send rejection message). */
-export async function declineTask(taskId: string, reason: string): Promise<void> {
+/** Decline a task. */
+export async function declineTask(taskId: string, _reason: string): Promise<void> {
   try {
-    await moltFetch(`/v1/task/${taskId}/decline`, 'POST', { reason });
+    const auth = await signAction('decline', taskId);
+    await moltFetch(`/api/tasks/${taskId}/decline`, 'POST', { ...auth });
   } catch (err) {
     console.error(`[moltlaunch] declineTask(${taskId}) error:`, (err as Error).message);
   }
 }
 
-/** Poll task status. Returns 'escrowed' once client locks funds. */
+/** Poll task status. Returns 'accepted' once client locks funds. */
 export async function getTaskStatus(taskId: string): Promise<MoltTask['status']> {
   try {
-    const task = await moltFetch<MoltTask>(`/v1/task/${taskId}`);
-    return task.status;
+    const data = await moltFetch<{ task: MoltTask }>(`/api/tasks/${taskId}`);
+    return data.task.status;
   } catch (err) {
     console.error(`[moltlaunch] getTaskStatus(${taskId}) error:`, (err as Error).message);
-    return 'pending';
+    return 'requested';
   }
 }
 
-/** Submit the completed deliverable as markdown content. */
-export async function submitDeliverable(taskId: string, markdownContent: string): Promise<boolean> {
+/** Submit the completed deliverable. */
+export async function submitDeliverable(taskId: string, result: string): Promise<boolean> {
   try {
-    await moltFetch(`/v1/task/${taskId}/submit`, 'POST', {
-      deliverable: markdownContent,
-      format: 'markdown',
-    });
+    const auth = await signAction('submit', taskId);
+    await moltFetch(`/api/tasks/${taskId}/submit`, 'POST', { result, files: [], ...auth });
     return true;
   } catch (err) {
     console.error(`[moltlaunch] submitDeliverable(${taskId}) error:`, (err as Error).message);
@@ -114,10 +122,11 @@ export async function submitDeliverable(taskId: string, markdownContent: string)
   }
 }
 
-/** Claim payment after 24hr dispute window. */
+/** Complete a task after the dispute window (requires txHash from escrow release). */
 export async function claimPayment(taskId: string): Promise<boolean> {
   try {
-    await moltFetch(`/v1/task/${taskId}/claim`, 'POST', {});
+    const auth = await signAction('complete', taskId);
+    await moltFetch(`/api/tasks/${taskId}/complete`, 'POST', { txHash: '0x0', ...auth });
     return true;
   } catch (err) {
     console.error(`[moltlaunch] claimPayment(${taskId}) error:`, (err as Error).message);

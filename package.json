@@ -13,7 +13,8 @@
     "dotenv": "^16.4.7",
     "openai": "^4.77.0",
     "tsx": "^4.19.3",
-    "typescript": "^5.8.2"
+    "typescript": "^5.8.2",
+    "viem": "^2.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.14"
